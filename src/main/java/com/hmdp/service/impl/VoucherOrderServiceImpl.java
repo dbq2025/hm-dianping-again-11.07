@@ -39,6 +39,17 @@ import java.util.concurrent.Executors;
 @Service
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
 
+    /** Stream 名称，必须与 seckill.lua 中 XADD 的 key 一致 */
+    private static final String STREAM_KEY = "stream.orders";
+    /** 消费者组名称 */
+    private static final String STREAM_GROUP = "g1";
+    /** 消费者名称 */
+    private static final String CONSUMER_NAME = "c1";
+    /** pending-list 单轮最多容忍的连续失败次数，防止异常时死循环刷屏 */
+    private static final int PENDING_MAX_FAILURES = 3;
+    /** pending-list 失败后的重试间隔（毫秒） */
+    private static final long PENDING_RETRY_INTERVAL_MS = 100L;
+
     @Resource
     private ISeckillVoucherService seckillVoucherService;
 
@@ -62,7 +73,46 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     @PostConstruct
     private void init() {
+        // 先自愈消费者组：FLUSHALL/FLUSHDB 会把 stream.orders 连同组 g1 一起删掉，
+        // 此时 XREADGROUP 必然抛 NOGROUP，因此必须先保证组存在，再启动消费线程
+        ensureGroupExists();
         SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
+    }
+
+    /**
+     * 幂等保证 Stream 与消费者组存在。
+     * <p>createGroup 在 key 不存在时会自动 MKSTREAM 建流；组已存在则抛 BUSYGROUP，忽略即可。</p>
+     */
+    private void ensureGroupExists() {
+        try {
+            stringRedisTemplate.opsForStream()
+                    .createGroup(STREAM_KEY, ReadOffset.from("0"), STREAM_GROUP);
+            log.info("已创建 Stream 消费者组：{}/{}", STREAM_KEY, STREAM_GROUP);
+        } catch (Exception e) {
+            // 组已存在（BUSYGROUP）属正常情况；其余异常（如 Redis 不可用）也不阻断启动
+            log.info("Stream 消费者组无需创建（可能已存在）：{}/{}", STREAM_KEY, STREAM_GROUP);
+        }
+    }
+
+    /**
+     * 判断异常链中是否包含 NOGROUP（流或消费者组不存在）。
+     */
+    private boolean isNoGroup(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            String msg = t.getMessage();
+            if (msg != null && msg.contains("NOGROUP")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private class VoucherOrderHandler implements Runnable {
@@ -71,11 +121,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         public void run() {
             while (true) {
                 try {
-                    // 1.获取消息队列中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS s1 >
+                    // 1.获取消息队列中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS stream.orders >
                     List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
-                            Consumer.from("g1", "c1"),
+                            Consumer.from(STREAM_GROUP, CONSUMER_NAME),
                             StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
-                            StreamOffset.create("stream.orders", ReadOffset.lastConsumed())
+                            StreamOffset.create(STREAM_KEY, ReadOffset.lastConsumed())
                     );
                     // 2.判断订单信息是否为空
                     if (list == null || list.isEmpty()) {
@@ -88,28 +138,38 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(value, new VoucherOrder(), true);
                     // 3.创建订单
                     createVoucherOrder(voucherOrder);
-                    // 4.确认消息 XACK
-                    stringRedisTemplate.opsForStream().acknowledge("s1", "g1", record.getId());
+                    // 4.确认消息 XACK（注意：必须用真实的 stream 名，不能沿用讲义示例里的 s1）
+                    stringRedisTemplate.opsForStream().acknowledge(STREAM_KEY, STREAM_GROUP, record.getId());
                 } catch (Exception e) {
-                    log.error("处理订单异常", e);
+                    // 组被删（典型场景：清空了 Redis）：重建后继续，不进入 pending 死循环
+                    if (isNoGroup(e)) {
+                        log.warn("消费者组不存在，正在重建：{}/{}", STREAM_KEY, STREAM_GROUP);
+                        ensureGroupExists();
+                        sleepQuietly(1000);
+                        continue;
+                    }
+                    log.error("处理订单异常，转入 pending-list 补偿", e);
+                    // 先退避再补偿，避免 Redis 不可用时异常空转把日志刷爆
+                    sleepQuietly(500);
                     handlePendingList();
                 }
             }
         }
 
         private void handlePendingList() {
-            while (true) {
+            int failures = 0;
+            while (failures < PENDING_MAX_FAILURES) {
                 try {
-                    // 1.获取pending-list中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS s1 0
+                    // 1.获取pending-list中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 STREAMS stream.orders 0
                     List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
-                            Consumer.from("g1", "c1"),
+                            Consumer.from(STREAM_GROUP, CONSUMER_NAME),
                             StreamReadOptions.empty().count(1),
-                            StreamOffset.create("stream.orders", ReadOffset.from("0"))
+                            StreamOffset.create(STREAM_KEY, ReadOffset.from("0"))
                     );
                     // 2.判断订单信息是否为空
                     if (list == null || list.isEmpty()) {
                         // 如果为null，说明没有异常消息，结束循环
-                        break;
+                        return;
                     }
                     // 解析数据
                     MapRecord<String, Object, Object> record = list.get(0);
@@ -118,11 +178,21 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     // 3.创建订单
                     createVoucherOrder(voucherOrder);
                     // 4.确认消息 XACK
-                    stringRedisTemplate.opsForStream().acknowledge("s1", "g1", record.getId());
+                    stringRedisTemplate.opsForStream().acknowledge(STREAM_KEY, STREAM_GROUP, record.getId());
+                    // 成功处理一条说明链路恢复，重置失败计数
+                    failures = 0;
                 } catch (Exception e) {
-                    log.error("处理订单异常", e);
+                    if (isNoGroup(e)) {
+                        log.warn("消费者组不存在，重建后退出 pending 处理：{}/{}", STREAM_KEY, STREAM_GROUP);
+                        ensureGroupExists();
+                        return;
+                    }
+                    failures++;
+                    log.error("处理 pending 消息异常（连续第 {} 次）", failures, e);
+                    sleepQuietly(PENDING_RETRY_INTERVAL_MS);
                 }
             }
+            log.warn("pending 消息连续处理失败 {} 次，本轮结束，等待下一轮重试", PENDING_MAX_FAILURES);
         }
     }
 
